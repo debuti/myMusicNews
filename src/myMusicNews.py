@@ -72,6 +72,8 @@ except:
   print("Install musicbrainzngs with: pip3 install musicbrainzngs")
   sys.exit(-1)
 
+SEP=";"
+
 # Usage function, logs, utils and check input
 def openLog(mode, desiredLevel):
     '''This function is for initialize the logging job
@@ -108,7 +110,7 @@ def openLog(mode, desiredLevel):
     
     if mode == "File" or mode == "RollingFile":
         if not os.path.isdir(logDirectory):
-            shellutils.mkdir(logDirectory)
+            os.mkdir(logDirectory)
   
         if mode == "File":
             openScreenAndFileLog(logPath, formatter, desiredLevel)
@@ -126,11 +128,28 @@ def closeLog():
 def checkInput():
     '''This function is for treat the user command line parameters.
     '''
+    def is_folder(string):
+      if os.path.isdir(string):
+        return string
+      else:
+        raise Exception("Path is not a folder")
+
     p = argparse.ArgumentParser(description=__description__,
                                 prog=__program__,
                                 usage='''''') 
-    p.add_argument('--album-folder', '-a', action="store",      type=str, dest="albumpath", required=True,  help="Path for albums")
-    p.add_argument('--csv-output',   '-c', action="store_true",           dest="csvoutput", required=False, help="Output given by the software")
+    p.add_argument('--album-folder', '-a', action="store", type=is_folder,
+                   dest="albumpath", required=True,  help="Path for albums")
+
+    subparsers = p.add_subparsers(help='Sub-command help', dest='command', required=True)
+
+    process_subparser = subparsers.add_parser("process", description="Process the music collection")
+    process_subparser.add_argument('--csv-output',   '-c', action="store", type=argparse.FileType('w'), 
+                                   dest="csvoutput", required=False, help="Output given by the software")
+
+    update_subparser = subparsers.add_parser("update", description="Update the user preferences")
+    update_subparser.add_argument('--csv-input',   '-c', action="store", type=argparse.FileType('r'),
+                                  dest="csvinput", required=True, help="Input, with user preferences for each album")
+
     return p.parse_args()
 
 def getReleaseGroups(artistId, type = 'all'):
@@ -150,11 +169,11 @@ def getReleaseGroups(artistId, type = 'all'):
   
     if artist["artist"]["release-group-count"] > 0:
       for releaseGroup in artist["artist"]["release-group-list"]:
-         result.append([releaseGroup['title'], 
-                        releaseGroup['first-release-date'] if releaseGroup['first-release-date'] != '' else None,
-                        releaseGroup['type'],
-                        releaseGroup['id'],
-                        sanitizeFilename(releaseGroup['title'])])
+         result.append({'title' : releaseGroup['title'], 
+                        'date'  : releaseGroup['first-release-date'] if releaseGroup['first-release-date'] != '' else None,
+                        'type'  : releaseGroup['type'],
+                        'id'    : releaseGroup['id'],
+                        'fname' : sanitizeFilename(releaseGroup['title'])})
         
     return result
 
@@ -194,10 +213,18 @@ def getGroupreleasesByArtist(diskArtist, type = 'all'):
 def checkMissingAlbums(args):
     '''
     '''
-    albumpath = args.albumpath
+    def csvappend(f, info):
+      TPL="\"{artist}\"{SEP}\"{title}\"{SEP}\"{date}\"{SEP}\"{rtype}\"{SEP}\"{status}\"\n"
+      if not hasattr(csvappend, "init"): 
+        f.write("SEP={SEP}\n".format(SEP=SEP))
+        f.write(TPL.format(artist="Artist", title="Title", status="Status [found, not-found, excluded]", rtype="Release type", date="Date", SEP=SEP))
+        csvappend.init=True
+      for status in ['found', 'not-found', 'excluded']:
+        for album in info['findings'][status]:
+          f.write(TPL.format(artist=info['artist'], title=album['title'], rtype=album['type'], date=album['date'], status=status, SEP=SEP))
 
-    for diskArtist in sorted([name for name in os.listdir(albumpath) if os.path.isdir(os.path.join(albumpath, name))]):
-        artistpath = os.path.join(albumpath, diskArtist)
+    for diskArtist in sorted([name for name in os.listdir(args.albumpath) if os.path.isdir(os.path.join(args.albumpath, name))]):
+        artistpath = os.path.join(args.albumpath, diskArtist)
         process = True
         excludes = []
 
@@ -216,19 +243,20 @@ def checkMissingAlbums(args):
             releaseGroups = getGroupreleasesByArtist(diskArtist)
             logging.info(" Found " + str(len(releaseGroups)) + " release groups")
                         
-            categories = {'found':[], 'not-found':[]}
+            categories = {'found':[], 'not-found':[], 'excluded':[]}
 
-            localReleases = list(map(lambda x: sanitizeFilename(x), [name for name in os.listdir(artistpath) if os.path.isdir(os.path.join(artistpath, name))]))
+            localReleases = list(map(lambda x: sanitizeFilename(x), 
+                                     [name for name in os.listdir(artistpath) if os.path.isdir(os.path.join(artistpath, name))]))
 
             for releaseGroup in releaseGroups:
                 found = False
-                if releaseGroup[0] in excludes:
-                  logging.info("  * Release {} skipped".format(releaseGroup[0]))
+                if releaseGroup['title'] in excludes:
+                  logging.info("  * Release {} skipped".format(releaseGroup["title"]))
+                  categories['excluded'].append(releaseGroup)
                   continue
 
                 for localDiskRelease in localReleases:
-                    
-                    if releaseGroup[4] in localDiskRelease:
+                    if releaseGroup['fname'] in localDiskRelease:
                         found = True
                         break
                     
@@ -237,20 +265,62 @@ def checkMissingAlbums(args):
                 else:
                     categories['not-found'].append(releaseGroup)
 
+            if args.csvoutput:
+              csvappend(args.csvoutput, {'artist': diskArtist, 'path': artistpath, 'findings':categories})
+            
             if len(categories['not-found']) > 0:
               logging.info("  - You DON'T have these albums")
-            for item in sorted(categories['not-found'], key=lambda x: x[2]):
-              logging.info((" "*3 + "-> " if item[2] == "Album" else " "*6) + diskArtist + " - "+ item[0] + (" as of " + item[1] if item[1] is not None else ""))
+              for item in sorted(categories['not-found'], key=lambda x: x['type']):
+                logging.info((" "*3 + "-> " if item['type'] == "Album" else " "*6) + diskArtist + " - "+ item['title'] + (" as of " + item['date'] if item['date'] is not None else ""))
                     
             time.sleep(5) #Prevent 503 error by waiting 5 seconds (as 50 request per second are allowed)
         else:
             logging.info(" Skipped")
-                
+            
+def updatePreferences(args):
+  from itertools import groupby
+  fields = ["artist", "title", "date", "rtype", "status"]
+  allalbums = [dict(zip(fields, [x.strip("\"") for x in line.strip().split(SEP)])) for line in args.csvinput.readlines()[2:]]
+  for artist, allartistalbums in groupby(sorted(allalbums, 
+                                                key=lambda x: x['artist']),
+                                         key=lambda x: x['artist']):
+    shouldwrite = False
+    statuses = {k: list(v) for k, v in groupby(sorted(allartistalbums,
+                                                      key=lambda x: x['status']),
+                                               key=lambda x: x['status'])}
+    artistpath = os.path.join(args.albumpath, artist)
+    prefpath = os.path.join(artistpath, "artist.toml")
+    if not os.path.isfile(prefpath):
+      config = {'musicNews' : {'skip':False, 'excludes':[]}}
+    else:
+      config = toml.load(prefpath)
+      if not "musicNews" in config:
+        raise Exception("Malformed artist.toml in {}".format(album['artist']))
+      
+    if len(config['musicNews']['excludes']) > 0 and "excluded" not in statuses:
+      config['musicNews']['excludes'] = []
+      shouldwrite = True
+      
+    if 'excluded' in statuses:
+      config['musicNews']['excludes'] = [album['title'] for album in statuses["excluded"]]
+      shouldwrite = True
+    
+    if shouldwrite:
+      tomls = pprint.pformat(config, indent=4)
+      logging.info(tomls)
+      with open(prefpath, "w") as tomlf:
+        toml.dump(config, tomlf)
+    
 def core(args):
     '''This is the core, all program logic is performed here
     '''
-    checkMissingAlbums(args)
-    #TODO: checkNewArtist(albumpath)
+    if args.command == "process":
+      checkMissingAlbums(args)
+      #TODO: checkNewArtist(albumpath)
+    elif args.command == "update":
+      updatePreferences(args)
+    else:
+      raise Exception("Unknown command")
 
 
 # Main function
